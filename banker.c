@@ -5,386 +5,417 @@
 
 #define MAX_LINE 1024
 
-static int NUMBER_OF_RESOURCES = 0;
-static int NUMBER_OF_CUSTOMERS = 0;
+typedef struct {
+    int n_customers;
+    int n_resources;
+    int *available;
+    int **maximum;
+    int **allocation;
+    int **need;
+} Banker;
 
-static int *available;      /* [R]    */
-static int **maximum;       /* [C][R] */
-static int **allocation;    /* [C][R] */
-static int **need;          /* [C][R] */
+void fatal(const char *msg);
+int *alloc_vec(int n);
+int **alloc_mat(int rows, int cols);
+void free_mat(int **m, int rows);
+char *trim(char *s);
+int parse_nonneg(const char *s, int *val);
+void banker_init(Banker *b, int argc, char *argv[]);
+void banker_free(Banker *b);
+void read_customers(Banker *b, const char *fname);
+void process_commands(Banker *b, const char *fname, FILE *out);
+int is_safe(const Banker *b);
+void request_resources(Banker *b, int cust, const int *req, FILE *out);
+void release_resources(Banker *b, int cust, const int *rel, FILE *out);
+void print_vec(const Banker *b, const int *v, FILE *out);
+void print_state(const Banker *b, FILE *out);
 
-static FILE *out;
-
-/* ---------- utilitários ---------- */
-
-static void fatal(const char *msg) {
+void fatal(const char *msg) {
     fprintf(stderr, "Erro: %s\n", msg);
     exit(EXIT_FAILURE);
 }
 
-static int *alloc_vec(int n) {
+int *alloc_vec(int n) {
     int *v = calloc(n, sizeof(int));
     if (!v) fatal("falha de alocacao de memoria.");
     return v;
 }
 
-static int **alloc_mat(int r, int c) {
-    int **m = malloc(r * sizeof(int *));
+int **alloc_mat(int rows, int cols) {
+    int i;
+    int **m = malloc(rows * sizeof(int *));
     if (!m) fatal("falha de alocacao de memoria.");
-    for (int i = 0; i < r; i++) m[i] = alloc_vec(c);
+    for (i = 0; i < rows; i++) m[i] = alloc_vec(cols);
     return m;
 }
 
-static void free_mat(int **m, int r) {
+void free_mat(int **m, int rows) {
+    int i;
     if (!m) return;
-    for (int i = 0; i < r; i++) free(m[i]);
+    for (i = 0; i < rows; i++) free(m[i]);
     free(m);
 }
 
-/* remove espacos/CR/LF nas pontas; retorna ponteiro dentro de s */
-static char *trim(char *s) {
+char *trim(char *s) {
+    char *e;
     while (isspace((unsigned char)*s)) s++;
     if (*s == '\0') return s;
-    char *e = s + strlen(s) - 1;
-    while (e > s && isspace((unsigned char)*e)) *e-- = '\0';
+    e = s + strlen(s) - 1;
+    while (e > s && isspace((unsigned char)*e)) {
+        *e = '\0';
+        e--;
+    }
     return s;
 }
 
-/* converte string para inteiro nao negativo estrito */
-static int parse_nonneg(const char *s, int *val) {
+int parse_nonneg(const char *s, int *val) {
+    const char *p;
+    long v;
     if (!s || !*s) return 0;
-    for (const char *p = s; *p; p++)
+    for (p = s; *p; p++)
         if (!isdigit((unsigned char)*p)) return 0;
-    long v = strtol(s, NULL, 10);
+    v = strtol(s, NULL, 10);
     if (v < 0 || v > 1000000000L) return 0;
     *val = (int)v;
     return 1;
 }
 
-/* ---------- leitura de customer.txt ---------- */
+void banker_init(Banker *b, int argc, char *argv[]) {
+    int j, v;
 
-/* conta linhas nao vazias */
+    if (argc < 2) {
+        fprintf(stderr, "Erro: numero de argumentos invalido.\n");
+        fprintf(stderr, "Uso: %s <inst_recurso_0> <inst_recurso_1> ...\n", argv[0]);
+        fprintf(stderr, "Exemplo: %s 10 5 7\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(b, 0, sizeof(Banker));
+    b->n_resources = argc - 1;
+    b->available = alloc_vec(b->n_resources);
+
+    for (j = 0; j < b->n_resources; j++) {
+        if (!parse_nonneg(argv[j + 1], &v)) {
+            fprintf(stderr, "Erro: argumento '%s' invalido; use inteiros nao negativos.\n", argv[j + 1]);
+            exit(EXIT_FAILURE);
+        }
+        b->available[j] = v;
+    }
+}
+
+void banker_free(Banker *b) {
+    free(b->available);
+    free_mat(b->maximum, b->n_customers);
+    free_mat(b->allocation, b->n_customers);
+    free_mat(b->need, b->n_customers);
+}
+
 static int count_customers(const char *fname) {
-    FILE *f = fopen(fname, "r");
+    FILE *f;
+    char line[MAX_LINE];
+    int n = 0;
+
+    f = fopen(fname, "r");
     if (!f) {
         fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'.\n", fname);
         exit(EXIT_FAILURE);
     }
-    char line[MAX_LINE];
-    int n = 0;
-    while (fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof(line), f)) {
         if (*trim(line) != '\0') n++;
     }
     fclose(f);
     return n;
 }
 
-static void read_customers(const char *fname) {
-    NUMBER_OF_CUSTOMERS = count_customers(fname);
-    if (NUMBER_OF_CUSTOMERS == 0)
+void read_customers(Banker *b, const char *fname) {
+    FILE *f;
+    char line[MAX_LINE];
+    char *t, *tok, *v;
+    int c = 0, r, j, val;
+
+    b->n_customers = count_customers(fname);
+    if (b->n_customers == 0)
         fatal("o arquivo customer.txt esta vazio.");
 
-    FILE *f = fopen(fname, "r");
+    f = fopen(fname, "r");
     if (!f) {
         fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'.\n", fname);
         exit(EXIT_FAILURE);
     }
 
-    maximum    = alloc_mat(NUMBER_OF_CUSTOMERS, NUMBER_OF_RESOURCES);
-    allocation = alloc_mat(NUMBER_OF_CUSTOMERS, NUMBER_OF_RESOURCES);
-    need       = alloc_mat(NUMBER_OF_CUSTOMERS, NUMBER_OF_RESOURCES);
+    b->maximum = alloc_mat(b->n_customers, b->n_resources);
+    b->allocation = alloc_mat(b->n_customers, b->n_resources);
+    b->need = alloc_mat(b->n_customers, b->n_resources);
 
-    char line[MAX_LINE];
-    int c = 0;
-    while (fgets(line, sizeof line, f)) {
-        char *t = trim(line);
+    while (fgets(line, sizeof(line), f)) {
+        t = trim(line);
         if (*t == '\0') continue;
 
-        int r = 0;
-        char *tok = strtok(t, ",");
+        r = 0;
+        tok = strtok(t, ",");
         while (tok) {
-            char *v = trim(tok);
-            int val;
+            v = trim(tok);
             if (!parse_nonneg(v, &val)) {
-                fprintf(stderr,
-                    "Erro: formatacao invalida em customer.txt (linha %d): "
-                    "valor '%s' nao e um inteiro nao negativo.\n", c + 1, v);
+                fprintf(stderr, "Erro: formatacao invalida em customer.txt (linha %d): valor '%s' invalido.\n", c + 1, v);
                 fclose(f);
                 exit(EXIT_FAILURE);
             }
-            if (r >= NUMBER_OF_RESOURCES) {
-                fprintf(stderr,
-                    "Erro: customer.txt (linha %d) possui mais colunas do que "
-                    "o numero de recursos informado (%d).\n",
-                    c + 1, NUMBER_OF_RESOURCES);
+            if (r >= b->n_resources) {
+                fprintf(stderr, "Erro: customer.txt (linha %d) possui mais colunas do que o numero de recursos informado (%d).\n", c + 1, b->n_resources);
                 fclose(f);
                 exit(EXIT_FAILURE);
             }
-            maximum[c][r] = val;
+            b->maximum[c][r] = val;
             r++;
             tok = strtok(NULL, ",");
         }
-        if (r != NUMBER_OF_RESOURCES) {
-            fprintf(stderr,
-                "Erro: customer.txt (linha %d) possui %d colunas, mas foram "
-                "informados %d recursos na linha de comando.\n",
-                c + 1, r, NUMBER_OF_RESOURCES);
+        if (r != b->n_resources) {
+            fprintf(stderr, "Erro: customer.txt (linha %d) possui %d colunas, mas foram informados %d recursos na linha de comando.\n", c + 1, r, b->n_resources);
             fclose(f);
             exit(EXIT_FAILURE);
         }
-        for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-            if (maximum[c][j] > available[j]) {
-                fprintf(stderr,
-                    "Erro: customer.txt (linha %d): maximo do recurso %d (%d) "
-                    "excede o total de instancias (%d).\n",
-                    c + 1, j, maximum[c][j], available[j]);
+        for (j = 0; j < b->n_resources; j++) {
+            if (b->maximum[c][j] > b->available[j]) {
+                fprintf(stderr, "Erro: customer.txt (linha %d): maximo do recurso %d (%d) excede o total de instancias (%d).\n", c + 1, j, b->maximum[c][j], b->available[j]);
                 fclose(f);
                 exit(EXIT_FAILURE);
             }
-            need[c][j] = maximum[c][j];
+            b->need[c][j] = b->maximum[c][j];
         }
         c++;
     }
     fclose(f);
 }
 
-/* ---------- algoritmo de seguranca ---------- */
+int is_safe(const Banker *b) {
+    int *work = alloc_vec(b->n_resources);
+    int *finish = alloc_vec(b->n_customers);
+    int i, j, ok, progress, safe;
 
-static int is_safe(void) {
-    int *work = alloc_vec(NUMBER_OF_RESOURCES);
-    int *finish = alloc_vec(NUMBER_OF_CUSTOMERS);
-    memcpy(work, available, NUMBER_OF_RESOURCES * sizeof(int));
+    memcpy(work, b->available, b->n_resources * sizeof(int));
 
-    int progress = 1;
+    progress = 1;
     while (progress) {
         progress = 0;
-        for (int i = 0; i < NUMBER_OF_CUSTOMERS; i++) {
+        for (i = 0; i < b->n_customers; i++) {
             if (finish[i]) continue;
-            int ok = 1;
-            for (int j = 0; j < NUMBER_OF_RESOURCES; j++)
-                if (need[i][j] > work[j]) { ok = 0; break; }
+            ok = 1;
+            for (j = 0; j < b->n_resources; j++) {
+                if (b->need[i][j] > work[j]) {
+                    ok = 0;
+                    break;
+                }
+            }
             if (ok) {
-                for (int j = 0; j < NUMBER_OF_RESOURCES; j++)
-                    work[j] += allocation[i][j];
+                for (j = 0; j < b->n_resources; j++)
+                    work[j] += b->allocation[i][j];
                 finish[i] = 1;
                 progress = 1;
             }
         }
     }
-    int safe = 1;
-    for (int i = 0; i < NUMBER_OF_CUSTOMERS; i++)
-        if (!finish[i]) { safe = 0; break; }
+
+    safe = 1;
+    for (i = 0; i < b->n_customers; i++) {
+        if (!finish[i]) {
+            safe = 0;
+            break;
+        }
+    }
 
     free(work);
     free(finish);
     return safe;
 }
 
-/* ---------- impressao ---------- */
-
-static void print_vec(const int *v) {
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++)
+void print_vec(const Banker *b, const int *v, FILE *out) {
+    int j;
+    for (j = 0; j < b->n_resources; j++)
         fprintf(out, "%d ", v[j]);
 }
 
-static void print_state(void) {
+void print_state(const Banker *b, FILE *out) {
+    int i;
     fprintf(out, "MAXIMUM | ALLOCATION | NEED\n");
-    for (int i = 0; i < NUMBER_OF_CUSTOMERS; i++) {
-        print_vec(maximum[i]);    fprintf(out, "| ");
-        print_vec(allocation[i]); fprintf(out, "| ");
-        print_vec(need[i]);
+    for (i = 0; i < b->n_customers; i++) {
+        print_vec(b, b->maximum[i], out);
+        fprintf(out, "| ");
+        print_vec(b, b->allocation[i], out);
+        fprintf(out, "| ");
+        print_vec(b, b->need[i], out);
         fprintf(out, "\n");
     }
     fprintf(out, "AVAILABLE ");
-    print_vec(available);
+    print_vec(b, b->available, out);
     fprintf(out, "\n");
 }
 
-/* ---------- request / release ---------- */
+void request_resources(Banker *b, int cust, const int *req, FILE *out) {
+    int j;
 
-static void request_resources(int cust, const int *req) {
-    /* 1) excede a necessidade (maximo) */
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        if (req[j] > need[cust][j]) {
+    for (j = 0; j < b->n_resources; j++) {
+        if (req[j] > b->need[cust][j]) {
             fprintf(out, "The customer %d request ", cust);
-            print_vec(req);
+            print_vec(b, req, out);
             fprintf(out, "was denied because exceed its maximum allocation\n");
             return;
         }
     }
-    /* 2) recursos insuficientes */
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        if (req[j] > available[j]) {
+
+    for (j = 0; j < b->n_resources; j++) {
+        if (req[j] > b->available[j]) {
             fprintf(out, "The resources ");
-            print_vec(available);
+            print_vec(b, b->available, out);
             fprintf(out, "are not enough to customer %d request ", cust);
-            print_vec(req);
+            print_vec(b, req, out);
             fprintf(out, "\n");
             return;
         }
     }
-    /* 3) alocacao hipotetica */
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        available[j]        -= req[j];
-        allocation[cust][j] += req[j];
-        need[cust][j]       -= req[j];
+
+    for (j = 0; j < b->n_resources; j++) {
+        b->available[j] -= req[j];
+        b->allocation[cust][j] += req[j];
+        b->need[cust][j] -= req[j];
     }
-    if (is_safe()) {
+
+    if (is_safe(b)) {
         fprintf(out, "Allocate to customer %d the resources ", cust);
-        print_vec(req);
+        print_vec(b, req, out);
         fprintf(out, "\n");
     } else {
-        /* rollback */
-        for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-            available[j]        += req[j];
-            allocation[cust][j] -= req[j];
-            need[cust][j]       += req[j];
+        for (j = 0; j < b->n_resources; j++) {
+            b->available[j] += req[j];
+            b->allocation[cust][j] -= req[j];
+            b->need[cust][j] += req[j];
         }
         fprintf(out, "The customer %d request ", cust);
-        print_vec(req);
+        print_vec(b, req, out);
         fprintf(out, "was denied because result in an unsafe state\n");
     }
 }
 
-static void release_resources(int cust, const int *rel) {
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        if (rel[j] > allocation[cust][j]) {
+void release_resources(Banker *b, int cust, const int *rel, FILE *out) {
+    int j;
+
+    for (j = 0; j < b->n_resources; j++) {
+        if (rel[j] > b->allocation[cust][j]) {
             fprintf(out, "The customer %d release ", cust);
-            print_vec(rel);
+            print_vec(b, rel, out);
             fprintf(out, "was denied because exceed its maximum allocation\n");
             return;
         }
     }
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        available[j]        += rel[j];
-        allocation[cust][j] -= rel[j];
-        need[cust][j]       += rel[j];
+
+    for (j = 0; j < b->n_resources; j++) {
+        b->available[j] += rel[j];
+        b->allocation[cust][j] -= rel[j];
+        b->need[cust][j] += rel[j];
     }
     fprintf(out, "Release from customer %d the resources ", cust);
-    print_vec(rel);
+    print_vec(b, rel, out);
     fprintf(out, "\n");
 }
 
-/* ---------- leitura de commands.txt ---------- */
+void process_commands(Banker *b, const char *fname, FILE *out) {
+    FILE *f;
+    char line[MAX_LINE];
+    char copy[MAX_LINE];
+    char *t, *cmd, *tok;
+    int lineno = 0, count, val, cust, j;
+    int *vec;
 
-static void process_commands(const char *fname) {
-    FILE *f = fopen(fname, "r");
+    f = fopen(fname, "r");
     if (!f) {
         fprintf(stderr, "Erro: nao foi possivel abrir o arquivo '%s'.\n", fname);
         exit(EXIT_FAILURE);
     }
 
-    /* primeira passada: valida TODO o arquivo antes de executar */
-    char line[MAX_LINE];
-    int lineno = 0;
-    while (fgets(line, sizeof line, f)) {
+    while (fgets(line, sizeof(line), f)) {
         lineno++;
-        char *t = trim(line);
+        t = trim(line);
         if (*t == '\0') continue;
 
-        char copy[MAX_LINE];
-        strncpy(copy, t, sizeof copy - 1);
-        copy[sizeof copy - 1] = '\0';
+        strncpy(copy, t, sizeof(copy) - 1);
+        copy[sizeof(copy) - 1] = '\0';
 
-        char *cmd = strtok(copy, " \t");
+        cmd = strtok(copy, " \t");
         if (strcmp(cmd, "*") == 0) {
             if (strtok(NULL, " \t")) {
-                fprintf(stderr, "Erro: commands.txt (linha %d): o comando '*' "
-                                "nao aceita argumentos.\n", lineno);
-                fclose(f); exit(EXIT_FAILURE);
+                fprintf(stderr, "Erro: commands.txt (linha %d): o comando '*' nao aceita argumentos.\n", lineno);
+                fclose(f);
+                exit(EXIT_FAILURE);
             }
             continue;
         }
         if (strcmp(cmd, "RQ") != 0 && strcmp(cmd, "RL") != 0) {
-            fprintf(stderr, "Erro: commands.txt (linha %d): comando '%s' "
-                            "desconhecido (use RQ, RL ou *).\n", lineno, cmd);
-            fclose(f); exit(EXIT_FAILURE);
+            fprintf(stderr, "Erro: commands.txt (linha %d): comando '%s' desconhecido (use RQ, RL ou *).\n", lineno, cmd);
+            fclose(f);
+            exit(EXIT_FAILURE);
         }
-        int count = 0, val;
-        char *tok;
-        int cust = -1;
+
+        count = 0;
+        cust = -1;
         while ((tok = strtok(NULL, " \t")) != NULL) {
             if (!parse_nonneg(tok, &val)) {
-                fprintf(stderr, "Erro: commands.txt (linha %d): valor '%s' "
-                                "invalido.\n", lineno, tok);
-                fclose(f); exit(EXIT_FAILURE);
+                fprintf(stderr, "Erro: commands.txt (linha %d): valor '%s' invalido.\n", lineno, tok);
+                fclose(f);
+                exit(EXIT_FAILURE);
             }
             if (count == 0) cust = val;
             count++;
         }
-        if (count != NUMBER_OF_RESOURCES + 1) {
-            fprintf(stderr, "Erro: commands.txt (linha %d): esperados %d "
-                            "valores (cliente + %d recursos), encontrados %d. "
-                            "O numero de recursos nao confere com os "
-                            "argumentos da execucao.\n",
-                    lineno, NUMBER_OF_RESOURCES + 1, NUMBER_OF_RESOURCES, count);
-            fclose(f); exit(EXIT_FAILURE);
+        if (count != b->n_resources + 1) {
+            fprintf(stderr, "Erro: commands.txt (linha %d): esperados %d valores (cliente + %d recursos), encontrados %d. O numero de recursos nao confere com os argumentos da execucao.\n", lineno, b->n_resources + 1, b->n_resources, count);
+            fclose(f);
+            exit(EXIT_FAILURE);
         }
-        if (cust >= NUMBER_OF_CUSTOMERS) {
-            fprintf(stderr, "Erro: commands.txt (linha %d): cliente %d "
-                            "inexistente (0 a %d).\n",
-                    lineno, cust, NUMBER_OF_CUSTOMERS - 1);
-            fclose(f); exit(EXIT_FAILURE);
+        if (cust >= b->n_customers) {
+            fprintf(stderr, "Erro: commands.txt (linha %d): cliente %d inexistente (0 a %d).\n", lineno, cust, b->n_customers - 1);
+            fclose(f);
+            exit(EXIT_FAILURE);
         }
     }
 
-    /* segunda passada: executa */
     rewind(f);
-    int *vec = alloc_vec(NUMBER_OF_RESOURCES);
-    while (fgets(line, sizeof line, f)) {
-        char *t = trim(line);
+    vec = alloc_vec(b->n_resources);
+
+    while (fgets(line, sizeof(line), f)) {
+        t = trim(line);
         if (*t == '\0') continue;
 
-        char *cmd = strtok(t, " \t");
+        cmd = strtok(t, " \t");
         if (strcmp(cmd, "*") == 0) {
-            print_state();
+            print_state(b, out);
             continue;
         }
-        int cust = atoi(strtok(NULL, " \t"));
-        for (int j = 0; j < NUMBER_OF_RESOURCES; j++)
+        cust = atoi(strtok(NULL, " \t"));
+        for (j = 0; j < b->n_resources; j++)
             vec[j] = atoi(strtok(NULL, " \t"));
 
-        if (strcmp(cmd, "RQ") == 0) request_resources(cust, vec);
-        else                        release_resources(cust, vec);
+        if (strcmp(cmd, "RQ") == 0)
+            request_resources(b, cust, vec, out);
+        else
+            release_resources(b, cust, vec, out);
     }
+
     free(vec);
     fclose(f);
 }
 
-/* ---------- main ---------- */
-
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Erro: numero de argumentos invalido.\n"
-                        "Uso: %s <inst_recurso_0> <inst_recurso_1> ...\n"
-                        "Exemplo: %s 10 5 7\n", argv[0], argv[0]);
-        return EXIT_FAILURE;
-    }
+    Banker b;
+    FILE *out;
 
-    NUMBER_OF_RESOURCES = argc - 1;
-    available = alloc_vec(NUMBER_OF_RESOURCES);
-
-    for (int j = 0; j < NUMBER_OF_RESOURCES; j++) {
-        int v;
-        if (!parse_nonneg(argv[j + 1], &v)) {
-            fprintf(stderr, "Erro: argumento '%s' invalido; use inteiros "
-                            "nao negativos.\n", argv[j + 1]);
-            return EXIT_FAILURE;
-        }
-        available[j] = v;
-    }
-
-    read_customers("customer.txt");
+    banker_init(&b, argc, argv);
+    read_customers(&b, "customer.txt");
 
     out = fopen("result.txt", "w");
     if (!out) fatal("nao foi possivel criar o arquivo result.txt.");
 
-    process_commands("commands.txt");
+    process_commands(&b, "commands.txt", out);
 
     fclose(out);
-    free(available);
-    free_mat(maximum, NUMBER_OF_CUSTOMERS);
-    free_mat(allocation, NUMBER_OF_CUSTOMERS);
-    free_mat(need, NUMBER_OF_CUSTOMERS);
+    banker_free(&b);
     return EXIT_SUCCESS;
 }
